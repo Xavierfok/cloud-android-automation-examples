@@ -1,0 +1,117 @@
+# Run checks on a real Android phone from a GitHub-hosted runner.
+#
+# The runner brings up a WireGuard tunnel to the phone, takes the phone's lock
+# over the STF API, connects adb, runs the smoke test (and Appium if asked),
+# then always releases the phone and drops the tunnel.
+#
+# Secrets (Settings > Secrets and variables > Actions):
+#   STF_TOKEN        access token from the phone console (Settings > Access tokens)
+#   DEVICE_SERIAL    the phone's serial
+#   WG_CONFIG        full text of the WireGuard .conf for this phone
+#   ADB_PRIVATE_KEY  contents of an adbkey file whose .pub is registered in the console
+#   ADB_PUBLIC_KEY   contents of that adbkey.pub
+# Optional repository variable:
+#   ADB_HOST         tunnel address of the phone's adb (cloudf.one: 10.77.0.1)
+#
+# Manual trigger only, so a fork without secrets doesn't fail on every push.
+# Add `push:` / `pull_request:` once your secrets are in place.
+#
+# Guide: https://cloudf.one/blog/cloud-phone-github-actions-ci
+
+name: real-device tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_appium:
+        description: "also run the Appium smoke test"
+        type: boolean
+        default: false
+
+# one phone, one job at a time. A second run queues instead of fighting over
+# the device, and a running test is never killed halfway by a newer push.
+concurrency:
+  group: cloud-phone-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  device:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      STF_API: https://cloudf.one/api/v1
+      STF_TOKEN: ${{ secrets.STF_TOKEN }}
+      DEVICE_SERIAL: ${{ secrets.DEVICE_SERIAL }}
+      ADB_HOST: ${{ vars.ADB_HOST || '10.77.0.1' }}
+      OUT_DIR: artifacts
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: set up android platform-tools
+        uses: android-actions/setup-android@v3
+
+      - name: bring up the tunnel
+        env:
+          WG_CONFIG: ${{ secrets.WG_CONFIG }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq wireguard-tools
+          # drop any DNS= line: wg-quick would need resolvconf for it, and we
+          # only ever talk to the phone's IP anyway
+          printf '%s\n' "$WG_CONFIG" | sed '/^[[:space:]]*DNS[[:space:]]*=/d' \
+            | sudo tee /etc/wireguard/phone.conf >/dev/null
+          sudo chmod 600 /etc/wireguard/phone.conf
+          sudo wg-quick up phone
+
+      - name: install the registered adb key
+        env:
+          ADB_PRIVATE_KEY: ${{ secrets.ADB_PRIVATE_KEY }}
+          ADB_PUBLIC_KEY: ${{ secrets.ADB_PUBLIC_KEY }}
+        run: |
+          # adb makes a fresh key on every new runner, and STF would refuse it.
+          # Reuse one key you registered once.
+          mkdir -p ~/.android
+          printf '%s\n' "$ADB_PRIVATE_KEY" > ~/.android/adbkey
+          printf '%s\n' "$ADB_PUBLIC_KEY" > ~/.android/adbkey.pub
+          chmod 600 ~/.android/adbkey
+          adb kill-server || true
+          adb start-server
+
+      - name: lock the phone and open remote debug
+        run: bash scripts/lock_device.sh >> "$GITHUB_ENV"
+
+      - name: connect adb
+        run: bash scripts/adb_connect.sh
+
+      - name: adb smoke test
+        run: bash scripts/adb_smoke.sh
+
+      - name: appium smoke test
+        if: ${{ inputs.run_appium }}
+        run: |
+          npm install -g appium
+          appium driver install uiautomator2
+          python3 -m pip install -q -r appium/requirements.txt
+          appium --log "$OUT_DIR/appium.log" &
+          for i in $(seq 1 30); do
+            curl -fs http://127.0.0.1:4723/status >/dev/null && break
+            sleep 1
+          done
+          python3 appium/smoke_test.py
+
+      - name: upload screenshots and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: device-artifacts
+          path: artifacts/
+          if-no-files-found: ignore
+
+      - name: release the phone
+        if: always()
+        run: bash scripts/release_device.sh
+
+      - name: drop the tunnel
+        if: always()
+        run: sudo wg-quick down phone || true

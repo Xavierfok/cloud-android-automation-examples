@@ -1,0 +1,8 @@
+.env
+*.conf
+adbkey
+adbkey.pub
+artifacts/
+__pycache__/
+*.pyc
+.venv/

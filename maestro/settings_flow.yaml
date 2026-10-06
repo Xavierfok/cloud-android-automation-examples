@@ -1,0 +1,17 @@
+# Maestro flow: open Settings, scroll to "About phone", screenshot it.
+# Read-only, safe on a hosted phone. Swap appId for your own app.
+#
+# Run against a network-adb phone (connect with scripts/adb_connect.sh first):
+#   maestro --device "$ADB_HOST:$ADB_PORT" test maestro/settings_flow.yaml
+#
+# Guide: https://cloudf.one/blog/cloud-phone-maestro-ui-testing
+appId: com.android.settings
+---
+- launchApp
+- scrollUntilVisible:
+    element:
+      text: "About phone"
+    direction: DOWN
+    timeout: 20000
+- tapOn: "About phone"
+- takeScreenshot: about-phone
